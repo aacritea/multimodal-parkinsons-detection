@@ -13,10 +13,13 @@ conda/
 # Data files
 *.csv
 *.data
-*.txt
 *.rar
 data/
 datasets/
+
+# Ignore raw data text files only
+data/**/*.txt
+datasets/**/*.txt
 
 # Models & outputs
 *.pt
@@ -27,3 +30,4 @@ outputs/
 logs/
 
 # OS
+.DS_Store
