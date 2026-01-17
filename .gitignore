@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.env
+.venv
+venv/
+conda/
+
+# Data files
+*.csv
+*.data
+*.txt
+*.rar
+data/
+datasets/
+
+# Models & outputs
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+outputs/
+logs/
+
+# OS
