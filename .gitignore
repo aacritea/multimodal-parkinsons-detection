@@ -20,6 +20,7 @@ datasets/
 # Ignore raw data text files only
 data/**/*.txt
 datasets/**/*.txt
+gait-in-parkinsons-disease-1.0.0/
 
 # Models & outputs
 *.pt
