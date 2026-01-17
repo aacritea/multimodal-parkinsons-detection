@@ -13,6 +13,24 @@ from sklearn.preprocessing import StandardScaler
 from pathlib import Path
 
 # ============================================================================
+# SET RANDOM SEEDS FOR REPRODUCIBILITY
+# ============================================================================
+
+def set_random_seeds(seed=42):
+    """Set random seeds for reproducibility."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# Call this at the start
+set_random_seeds(42)
+
+# ============================================================================
 # PART 1: VOICE DATA PREPROCESSING
 # ============================================================================
 
@@ -1422,3 +1440,1019 @@ print(f"Recall/Sensitivity: {detailed_metrics['sensitivity']:.4f}")
 print(f"Specificity: {detailed_metrics['specificity']:.4f}")
 print(f"F1-Score: {detailed_metrics['f1_score']:.4f}")
 print(f"AUC-ROC: {detailed_metrics['auc_roc']:.4f}")
+
+# ===========================================================================
+# BASELINE COMPARISON STUDY
+# ===========================================================================
+
+print("\n" + "="*70)
+print("RUNNING BASELINE COMPARISON STUDY")
+print("="*70)
+
+# Save the attention fusion results first
+attention_fusion_results = {
+    'Accuracy': detailed_metrics['accuracy'],
+    'Precision': detailed_metrics['precision'],
+    'Recall': detailed_metrics['sensitivity'],
+    'F1-Score': detailed_metrics['f1_score'],
+    'AUC-ROC': detailed_metrics['auc_roc']
+}
+
+# ===========================================================================
+# 1. VOICE-ONLY BASELINE
+# ===========================================================================
+
+class VoiceOnlyClassifier(nn.Module):
+    """Voice-only baseline model."""
+    def __init__(self, voice_encoder):
+        super(VoiceOnlyClassifier, self).__init__()
+        self.voice_encoder = voice_encoder
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, voice_input):
+        voice_embedding = self.voice_encoder(voice_input)
+        logits = self.classifier(voice_embedding)
+        return logits
+
+print("\n[1/3] Training Voice-Only Baseline...")
+print("-" * 70)
+
+voice_encoder_baseline = VoiceMLPEncoder(input_dim=22, embedding_dim=128, hidden_dim=384)
+voice_only_model = VoiceOnlyClassifier(voice_encoder_baseline).to('cpu')
+
+criterion_voice = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer_voice = torch.optim.Adam(voice_only_model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+best_val_loss = float('inf')
+best_model_state = None
+patience_count = 0
+
+for epoch in range(50):
+    # Training
+    voice_only_model.train()
+    for voice_features, labels in train_loader_voice:
+        voice_features = voice_features.to('cpu')
+        labels = labels.to('cpu').unsqueeze(1)
+        
+        optimizer_voice.zero_grad()
+        logits = voice_only_model(voice_features)
+        loss = criterion_voice(logits, labels)
+        loss.backward()
+        optimizer_voice.step()
+    
+    # Validation
+    voice_only_model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for voice_features, labels in val_loader_voice:
+            voice_features = voice_features.to('cpu')
+            labels = labels.to('cpu').unsqueeze(1)
+            logits = voice_only_model(voice_features)
+            loss = criterion_voice(logits, labels)
+            val_loss += loss.item()
+    
+    val_loss /= len(val_loader_voice)
+    
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = voice_only_model.state_dict().copy()
+        patience_count = 0
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch+1}: Val Loss = {val_loss:.4f} (Best)")
+    else:
+        patience_count += 1
+    
+    if patience_count >= 15:
+        print(f"Early stopping at epoch {epoch+1}")
+        break
+
+if best_model_state:
+    voice_only_model.load_state_dict(best_model_state)
+
+# Evaluate Voice-Only
+voice_only_model.eval()
+voice_predictions = []
+voice_probabilities = []
+voice_labels = []
+
+with torch.no_grad():
+    for voice_features, labels in test_loader_voice:
+        voice_features = voice_features.to('cpu')
+        logits = voice_only_model(voice_features)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        
+        voice_predictions.extend(preds.cpu().numpy())
+        voice_probabilities.extend(probs.cpu().numpy())
+        voice_labels.extend(labels.numpy())
+
+voice_metrics = compute_detailed_metrics(
+    np.array(voice_predictions),
+    np.array(voice_labels),
+    np.array(voice_probabilities)
+)
+
+print(f"Voice-Only Test Accuracy: {voice_metrics['accuracy']:.4f}")
+
+# ===========================================================================
+# 2. GAIT-ONLY BASELINE
+# ===========================================================================
+
+class GaitOnlyClassifier(nn.Module):
+    """Gait-only baseline model."""
+    def __init__(self, gait_encoder):
+        super(GaitOnlyClassifier, self).__init__()
+        self.gait_encoder = gait_encoder
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, gait_input):
+        gait_embedding = self.gait_encoder(gait_input)
+        logits = self.classifier(gait_embedding)
+        return logits
+
+print("\n[2/3] Training Gait-Only Baseline...")
+print("-" * 70)
+
+gait_encoder_baseline = GaitCNNEncoder(in_channels=19, embedding_dim=128)
+gait_only_model = GaitOnlyClassifier(gait_encoder_baseline).to('cpu')
+
+criterion_gait = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer_gait = torch.optim.Adam(gait_only_model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+best_val_loss = float('inf')
+best_model_state = None
+patience_count = 0
+
+for epoch in range(50):
+    # Training
+    gait_only_model.train()
+    for gait_windows, labels, _ in train_loader_gait:
+        gait_windows = gait_windows.to('cpu')
+        labels = labels.to('cpu').unsqueeze(1)
+        
+        optimizer_gait.zero_grad()
+        logits = gait_only_model(gait_windows)
+        loss = criterion_gait(logits, labels)
+        loss.backward()
+        optimizer_gait.step()
+    
+    # Validation
+    gait_only_model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for gait_windows, labels, _ in val_loader_gait:
+            gait_windows = gait_windows.to('cpu')
+            labels = labels.to('cpu').unsqueeze(1)
+            logits = gait_only_model(gait_windows)
+            loss = criterion_gait(logits, labels)
+            val_loss += loss.item()
+    
+    val_loss /= len(val_loader_gait)
+    
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = gait_only_model.state_dict().copy()
+        patience_count = 0
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch+1}: Val Loss = {val_loss:.4f} (Best)")
+    else:
+        patience_count += 1
+    
+    if patience_count >= 15:
+        print(f"Early stopping at epoch {epoch+1}")
+        break
+
+if best_model_state:
+    gait_only_model.load_state_dict(best_model_state)
+
+# Evaluate Gait-Only
+gait_only_model.eval()
+gait_predictions = []
+gait_probabilities = []
+gait_labels = []
+
+with torch.no_grad():
+    for gait_windows, labels, _ in test_loader_gait:
+        gait_windows = gait_windows.to('cpu')
+        logits = gait_only_model(gait_windows)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        
+        gait_predictions.extend(preds.cpu().numpy())
+        gait_probabilities.extend(probs.cpu().numpy())
+        gait_labels.extend(labels.numpy())
+
+gait_metrics = compute_detailed_metrics(
+    np.array(gait_predictions),
+    np.array(gait_labels),
+    np.array(gait_probabilities)
+)
+
+print(f"Gait-Only Test Accuracy: {gait_metrics['accuracy']:.4f}")
+
+# ===========================================================================
+# 3. CONCATENATION FUSION BASELINE
+# ===========================================================================
+
+class ConcatenationFusionClassifier(nn.Module):
+    """Multimodal fusion using simple concatenation (no attention)."""
+    def __init__(self, voice_encoder, gait_encoder):
+        super(ConcatenationFusionClassifier, self).__init__()
+        self.voice_encoder = voice_encoder
+        self.gait_encoder = gait_encoder
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, voice_input, gait_input):
+        voice_emb = self.voice_encoder(voice_input)
+        gait_emb = self.gait_encoder(gait_input)
+        fused = torch.cat([voice_emb, gait_emb], dim=1)
+        logits = self.classifier(fused)
+        return logits
+
+print("\n[3/3] Training Concatenation Fusion Baseline...")
+print("-" * 70)
+
+voice_encoder_concat = VoiceMLPEncoder(input_dim=22, embedding_dim=128, hidden_dim=384)
+gait_encoder_concat = GaitCNNEncoder(in_channels=19, embedding_dim=128)
+concat_model = ConcatenationFusionClassifier(voice_encoder_concat, gait_encoder_concat).to('cpu')
+
+criterion_concat = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer_concat = torch.optim.Adam(concat_model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+best_val_loss = float('inf')
+best_model_state = None
+patience_count = 0
+
+for epoch in range(50):
+    # Training
+    concat_model.train()
+    voice_iter = iter(train_loader_voice)
+    
+    for gait_windows, gait_labels, _ in train_loader_gait:
+        try:
+            voice_features, _ = next(voice_iter)
+        except StopIteration:
+            voice_iter = iter(train_loader_voice)
+            voice_features, _ = next(voice_iter)
+        
+        min_batch = min(voice_features.size(0), gait_windows.size(0))
+        voice_features = voice_features[:min_batch].to('cpu')
+        gait_windows = gait_windows[:min_batch].to('cpu')
+        labels = gait_labels[:min_batch].to('cpu').unsqueeze(1)
+        
+        optimizer_concat.zero_grad()
+        logits = concat_model(voice_features, gait_windows)
+        loss = criterion_concat(logits, labels)
+        loss.backward()
+        optimizer_concat.step()
+    
+    # Validation
+    concat_model.eval()
+    val_loss = 0.0
+    voice_iter = iter(val_loader_voice)
+    
+    with torch.no_grad():
+        for gait_windows, gait_labels, _ in val_loader_gait:
+            try:
+                voice_features, _ = next(voice_iter)
+            except StopIteration:
+                voice_iter = iter(val_loader_voice)
+                voice_features, _ = next(voice_iter)
+            
+            min_batch = min(voice_features.size(0), gait_windows.size(0))
+            voice_features = voice_features[:min_batch].to('cpu')
+            gait_windows = gait_windows[:min_batch].to('cpu')
+            labels = gait_labels[:min_batch].to('cpu').unsqueeze(1)
+            
+            logits = concat_model(voice_features, gait_windows)
+            loss = criterion_concat(logits, labels)
+            val_loss += loss.item()
+    
+    val_loss /= len(val_loader_gait)
+    
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = concat_model.state_dict().copy()
+        patience_count = 0
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch+1}: Val Loss = {val_loss:.4f} (Best)")
+    else:
+        patience_count += 1
+    
+    if patience_count >= 15:
+        print(f"Early stopping at epoch {epoch+1}")
+        break
+
+if best_model_state:
+    concat_model.load_state_dict(best_model_state)
+
+# Evaluate Concatenation Fusion
+concat_model.eval()
+concat_predictions = []
+concat_probabilities = []
+concat_labels = []
+
+voice_iter = iter(test_loader_voice)
+
+with torch.no_grad():
+    for gait_windows, gait_labels, _ in test_loader_gait:
+        try:
+            voice_features, _ = next(voice_iter)
+        except StopIteration:
+            voice_iter = iter(test_loader_voice)
+            voice_features, _ = next(voice_iter)
+        
+        min_batch = min(voice_features.size(0), gait_windows.size(0))
+        voice_features = voice_features[:min_batch].to('cpu')
+        gait_windows = gait_windows[:min_batch].to('cpu')
+        labels = gait_labels[:min_batch]
+        
+        logits = concat_model(voice_features, gait_windows)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        
+        concat_predictions.extend(preds.cpu().numpy())
+        concat_probabilities.extend(probs.cpu().numpy())
+        concat_labels.extend(labels.numpy())
+
+concat_metrics = compute_detailed_metrics(
+    np.array(concat_predictions),
+    np.array(concat_labels),
+    np.array(concat_probabilities)
+)
+
+print(f"Concatenation Fusion Test Accuracy: {concat_metrics['accuracy']:.4f}")
+
+# ===========================================================================
+# CREATE COMPARISON TABLE
+# ===========================================================================
+
+results_dict = {
+    'Voice-Only': {
+        'Accuracy': voice_metrics['accuracy'],
+        'Precision': voice_metrics['precision'],
+        'Recall': voice_metrics['sensitivity'],
+        'F1-Score': voice_metrics['f1_score'],
+        'AUC-ROC': voice_metrics['auc_roc']
+    },
+    'Gait-Only': {
+        'Accuracy': gait_metrics['accuracy'],
+        'Precision': gait_metrics['precision'],
+        'Recall': gait_metrics['sensitivity'],
+        'F1-Score': gait_metrics['f1_score'],
+        'AUC-ROC': gait_metrics['auc_roc']
+    },
+    'Concatenation Fusion': {
+        'Accuracy': concat_metrics['accuracy'],
+        'Precision': concat_metrics['precision'],
+        'Recall': concat_metrics['sensitivity'],
+        'F1-Score': concat_metrics['f1_score'],
+        'AUC-ROC': concat_metrics['auc_roc']
+    },
+    'Attention Fusion (Proposed)': attention_fusion_results
+}
+
+results_table = pd.DataFrame(results_dict).T
+
+print("\n" + "="*70)
+print("FINAL COMPARISON TABLE - ALL MODELS")
+print("="*70)
+print(results_table.round(4).to_string())
+print("="*70)
+
+# Save to CSV
+results_table.to_csv('baseline_comparison_results.csv')
+print("\n✓ Results saved to: baseline_comparison_results.csv")
+
+# ===========================================================================
+# ABLATION STUDY
+# ===========================================================================
+
+print("\n" + "="*70)
+print("ABLATION STUDY - COMPONENT ANALYSIS")
+print("="*70)
+print("\nEvaluating the contribution of each component:")
+print("  1. Attention mechanism")
+print("  2. Modality dropout")
+print("  3. Full proposed model (attention + modality dropout)")
+print("-"*70)
+
+ablation_results = {}
+
+# ===========================================================================
+# ABLATION 1: Simple Concatenation Fusion (No Attention, No Modality Dropout)
+# ===========================================================================
+
+print("\n[Ablation 1/3] Simple Concatenation Fusion")
+print("  - No attention mechanism")
+print("  - No modality dropout")
+print("-" * 70)
+
+class SimpleConcatenationFusion(nn.Module):
+    """
+    Baseline: Simple concatenation without attention or modality dropout.
+    """
+    def __init__(self, voice_encoder, gait_encoder):
+        super(SimpleConcatenationFusion, self).__init__()
+        self.voice_encoder = voice_encoder
+        self.gait_encoder = gait_encoder
+        
+        # Direct concatenation fusion
+        self.fusion_classifier = nn.Sequential(
+            nn.Linear(256, 128),  # 128 (voice) + 128 (gait) = 256
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, voice_input, gait_input):
+        voice_emb = self.voice_encoder(voice_input)
+        gait_emb = self.gait_encoder(gait_input)
+        
+        # Simple concatenation
+        concatenated = torch.cat([voice_emb, gait_emb], dim=1)
+        logits = self.fusion_classifier(concatenated)
+        return logits
+
+# Train Simple Concatenation
+voice_enc_concat = VoiceMLPEncoder(input_dim=22, embedding_dim=128, hidden_dim=384)
+gait_enc_concat = GaitCNNEncoder(in_channels=19, embedding_dim=128)
+simple_concat_model = SimpleConcatenationFusion(voice_enc_concat, gait_enc_concat).to('cpu')
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to('cpu'))
+optimizer = torch.optim.Adam(simple_concat_model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+best_val_loss = float('inf')
+best_model_state = None
+patience_count = 0
+
+for epoch in range(50):
+    # Training
+    simple_concat_model.train()
+    voice_iter = iter(train_loader_voice)
+    
+    for gait_windows, gait_labels, _ in train_loader_gait:
+        try:
+            voice_features, _ = next(voice_iter)
+        except StopIteration:
+            voice_iter = iter(train_loader_voice)
+            voice_features, _ = next(voice_iter)
+        
+        min_batch = min(voice_features.size(0), gait_windows.size(0))
+        voice_features = voice_features[:min_batch].to('cpu')
+        gait_windows = gait_windows[:min_batch].to('cpu')
+        labels = gait_labels[:min_batch].to('cpu').unsqueeze(1)
+        
+        optimizer.zero_grad()
+        logits = simple_concat_model(voice_features, gait_windows)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+    
+    # Validation
+    simple_concat_model.eval()
+    val_loss = 0.0
+    voice_iter = iter(val_loader_voice)
+    
+    with torch.no_grad():
+        for gait_windows, gait_labels, _ in val_loader_gait:
+            try:
+                voice_features, _ = next(voice_iter)
+            except StopIteration:
+                voice_iter = iter(val_loader_voice)
+                voice_features, _ = next(voice_iter)
+            
+            min_batch = min(voice_features.size(0), gait_windows.size(0))
+            voice_features = voice_features[:min_batch].to('cpu')
+            gait_windows = gait_windows[:min_batch].to('cpu')
+            labels = gait_labels[:min_batch].to('cpu').unsqueeze(1)
+            
+            logits = simple_concat_model(voice_features, gait_windows)
+            loss = criterion(logits, labels)
+            val_loss += loss.item()
+    
+    val_loss /= len(val_loader_gait)
+    
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = simple_concat_model.state_dict().copy()
+        patience_count = 0
+        if epoch % 10 == 0:
+            print(f"  Epoch {epoch+1}: Val Loss = {val_loss:.4f}")
+    else:
+        patience_count += 1
+    
+    if patience_count >= 15:
+        print(f"  Early stopping at epoch {epoch+1}")
+        break
+
+if best_model_state:
+    simple_concat_model.load_state_dict(best_model_state)
+
+# Evaluate
+simple_concat_model.eval()
+predictions = []
+probabilities = []
+labels_list = []
+
+voice_iter = iter(test_loader_voice)
+
+with torch.no_grad():
+    for gait_windows, gait_labels, _ in test_loader_gait:
+        try:
+            voice_features, _ = next(voice_iter)
+        except StopIteration:
+            voice_iter = iter(test_loader_voice)
+            voice_features, _ = next(voice_iter)
+        
+        min_batch = min(voice_features.size(0), gait_windows.size(0))
+        voice_features = voice_features[:min_batch].to('cpu')
+        gait_windows = gait_windows[:min_batch].to('cpu')
+        labels = gait_labels[:min_batch]
+        
+        logits = simple_concat_model(voice_features, gait_windows)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        
+        predictions.extend(preds.cpu().numpy())
+        probabilities.extend(probs.cpu().numpy())
+        labels_list.extend(labels.numpy())
+
+metrics = compute_detailed_metrics(
+    np.array(predictions),
+    np.array(labels_list),
+    np.array(probabilities)
+)
+
+ablation_results['Simple Concatenation'] = {
+    'Accuracy': metrics['accuracy'],
+    'Precision': metrics['precision'],
+    'Recall': metrics['sensitivity'],
+    'F1-Score': metrics['f1_score'],
+    'AUC-ROC': metrics['auc_roc']
+}
+
+print(f"  ✓ Test Accuracy: {metrics['accuracy']:.4f}, AUC-ROC: {metrics['auc_roc']:.4f}")
+
+# ===========================================================================
+# ABLATION 2: Attention Fusion WITHOUT Modality Dropout
+# ===========================================================================
+
+print("\n[Ablation 2/3] Attention Fusion (No Modality Dropout)")
+print("  - With attention mechanism ✓")
+print("  - No modality dropout")
+print("-" * 70)
+
+# Create model with attention but NO modality dropout
+voice_enc_attn = VoiceMLPEncoder(input_dim=22, embedding_dim=128, hidden_dim=384)
+gait_enc_attn = GaitCNNEncoder(in_channels=19, embedding_dim=128)
+attention_no_dropout_model = MultimodalClassifier(
+    voice_enc_attn, 
+    gait_enc_attn,
+    fusion_hidden_dim=64,
+    classifier_hidden_dim=64,
+    dropout=0.3,
+    modality_dropout=0.0  # NO modality dropout
+).to('cpu')
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to('cpu'))
+optimizer = torch.optim.Adam(attention_no_dropout_model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+best_val_loss = float('inf')
+best_model_state = None
+patience_count = 0
+
+for epoch in range(50):
+    # Training
+    train_metrics = train_epoch(
+        attention_no_dropout_model, 
+        train_loader_voice, 
+        train_loader_gait,
+        criterion, 
+        optimizer, 
+        'cpu'
+    )
+    
+    # Validation
+    val_metrics = evaluate(
+        attention_no_dropout_model,
+        val_loader_voice,
+        val_loader_gait,
+        criterion,
+        'cpu'
+    )
+    
+    if val_metrics['loss'] < best_val_loss:
+        best_val_loss = val_metrics['loss']
+        best_model_state = attention_no_dropout_model.state_dict().copy()
+        patience_count = 0
+        if epoch % 10 == 0:
+            print(f"  Epoch {epoch+1}: Val Loss = {val_metrics['loss']:.4f}, Val Acc = {val_metrics['accuracy']:.4f}")
+    else:
+        patience_count += 1
+    
+    if patience_count >= 15:
+        print(f"  Early stopping at epoch {epoch+1}")
+        break
+
+if best_model_state:
+    attention_no_dropout_model.load_state_dict(best_model_state)
+
+# Evaluate
+test_metrics = evaluate(
+    attention_no_dropout_model,
+    test_loader_voice,
+    test_loader_gait,
+    nn.BCEWithLogitsLoss(),
+    'cpu'
+)
+
+metrics = compute_detailed_metrics(
+    test_metrics['predictions'],
+    test_metrics['labels'],
+    test_metrics['probabilities']
+)
+
+ablation_results['Attention (No Modality Dropout)'] = {
+    'Accuracy': metrics['accuracy'],
+    'Precision': metrics['precision'],
+    'Recall': metrics['sensitivity'],
+    'F1-Score': metrics['f1_score'],
+    'AUC-ROC': metrics['auc_roc']
+}
+
+print(f"  ✓ Test Accuracy: {metrics['accuracy']:.4f}, AUC-ROC: {metrics['auc_roc']:.4f}")
+
+# ===========================================================================
+# ABLATION 3: Full Proposed Model (Attention + Modality Dropout)
+# ===========================================================================
+
+print("\n[Ablation 3/3] Full Proposed Model")
+print("  - With attention mechanism ✓")
+print("  - With modality dropout ✓")
+print("-" * 70)
+
+# This is the model you already trained
+# Use the results from your main training
+
+ablation_results['Full Proposed Model'] = {
+    'Accuracy': detailed_metrics['accuracy'],
+    'Precision': detailed_metrics['precision'],
+    'Recall': detailed_metrics['sensitivity'],
+    'F1-Score': detailed_metrics['f1_score'],
+    'AUC-ROC': detailed_metrics['auc_roc']
+}
+
+print(f"  ✓ Test Accuracy: {detailed_metrics['accuracy']:.4f}, AUC-ROC: {detailed_metrics['auc_roc']:.4f}")
+print("  (Using already trained model)")
+
+# ===========================================================================
+# CREATE ABLATION STUDY TABLE
+# ===========================================================================
+
+ablation_table = pd.DataFrame(ablation_results).T
+
+print("\n" + "="*70)
+print("ABLATION STUDY RESULTS")
+print("="*70)
+print("\nComponent Analysis:")
+print(ablation_table.round(4).to_string())
+print("="*70)
+
+# Calculate improvements
+simple_concat_acc = ablation_results['Simple Concatenation']['Accuracy']
+attn_no_drop_acc = ablation_results['Attention (No Modality Dropout)']['Accuracy']
+full_model_acc = ablation_results['Full Proposed Model']['Accuracy']
+
+print("\nContribution Analysis:")
+print(f"  Attention mechanism gain: {(attn_no_drop_acc - simple_concat_acc)*100:+.2f}%")
+print(f"  Modality dropout gain: {(full_model_acc - attn_no_drop_acc)*100:+.2f}%")
+print(f"  Total improvement: {(full_model_acc - simple_concat_acc)*100:+.2f}%")
+print("="*70)
+
+# Save ablation results
+ablation_table.to_csv('ablation_study_results.csv')
+print("\n✓ Ablation results saved to: ablation_study_results.csv")
+
+# ===========================================================================
+# COMBINED RESULTS TABLE (Baselines + Ablation)
+# ===========================================================================
+
+print("\n" + "="*70)
+print("COMPLETE EXPERIMENTAL RESULTS")
+print("="*70)
+
+# Combine all results
+all_results = {
+    '1. Voice-Only Baseline': results_dict['Voice-Only'],
+    '2. Gait-Only Baseline': results_dict['Gait-Only'],
+    '3. Simple Concatenation': ablation_results['Simple Concatenation'],
+    '4. Attention Fusion': ablation_results['Attention (No Modality Dropout)'],
+    '5. Full Proposed Model': ablation_results['Full Proposed Model']
+}
+
+complete_table = pd.DataFrame(all_results).T
+
+print("\nAll Models Comparison:")
+print(complete_table.round(4).to_string())
+print("="*70)
+
+# Save complete results
+complete_table.to_csv('complete_experimental_results.csv')
+print("\n✓ Complete results saved to: complete_experimental_results.csv")
+
+# ===========================================================================
+# STATISTICAL SUMMARY
+# ===========================================================================
+
+print("\n" + "="*70)
+print("STATISTICAL SUMMARY FOR IEEE PAPER")
+print("="*70)
+
+print("\nBaseline Performance:")
+print(f"  Voice-Only:  Acc={results_dict['Voice-Only']['Accuracy']:.4f}, AUC={results_dict['Voice-Only']['AUC-ROC']:.4f}")
+print(f"  Gait-Only:   Acc={results_dict['Gait-Only']['Accuracy']:.4f}, AUC={results_dict['Gait-Only']['AUC-ROC']:.4f}")
+
+print("\nMultimodal Fusion Variants:")
+print(f"  Simple Concat:     Acc={ablation_results['Simple Concatenation']['Accuracy']:.4f}, AUC={ablation_results['Simple Concatenation']['AUC-ROC']:.4f}")
+print(f"  + Attention:       Acc={ablation_results['Attention (No Modality Dropout)']['Accuracy']:.4f}, AUC={ablation_results['Attention (No Modality Dropout)']['AUC-ROC']:.4f}")
+print(f"  + Mod. Dropout:    Acc={ablation_results['Full Proposed Model']['Accuracy']:.4f}, AUC={ablation_results['Full Proposed Model']['AUC-ROC']:.4f}")
+
+print("\nKey Findings:")
+best_unimodal = max(results_dict['Voice-Only']['Accuracy'], results_dict['Gait-Only']['Accuracy'])
+improvement = (full_model_acc - best_unimodal) * 100
+print(f"  • Multimodal vs. Best Unimodal: +{improvement:.2f}% accuracy")
+print(f"  • Attention contribution: +{(attn_no_drop_acc - simple_concat_acc)*100:.2f}%")
+print(f"  • Modality dropout contribution: +{(full_model_acc - attn_no_drop_acc)*100:.2f}%")
+print(f"  • Final Performance: {full_model_acc*100:.2f}% accuracy, {ablation_results['Full Proposed Model']['AUC-ROC']*100:.2f}% AUC-ROC")
+
+print("="*70)
+
+# ===========================================================================
+# PUBLICATION-READY VISUALIZATIONS
+# ===========================================================================
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, confusion_matrix
+import seaborn as sns
+
+print("\n" + "="*70)
+print("GENERATING PUBLICATION-READY PLOTS")
+print("="*70)
+
+# Set publication style
+plt.style.use('seaborn-v0_8-paper')
+sns.set_palette("husl")
+
+# ===========================================================================
+# PLOT 1: ROC CURVES
+# ===========================================================================
+
+print("\n[1/3] Generating ROC curves...")
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# Voice-Only ROC
+fpr_voice, tpr_voice, _ = roc_curve(voice_labels, voice_probabilities)
+roc_auc_voice = auc(fpr_voice, tpr_voice)
+ax.plot(fpr_voice, tpr_voice, linewidth=2, label=f'Voice-Only (AUC = {roc_auc_voice:.3f})')
+
+# Gait-Only ROC
+fpr_gait, tpr_gait, _ = roc_curve(gait_labels, gait_probabilities)
+roc_auc_gait = auc(fpr_gait, tpr_gait)
+ax.plot(fpr_gait, tpr_gait, linewidth=2, label=f'Gait-Only (AUC = {roc_auc_gait:.3f})')
+
+# Simple Concatenation ROC
+fpr_concat, tpr_concat, _ = roc_curve(labels_list, probabilities)
+roc_auc_concat = auc(fpr_concat, tpr_concat)
+ax.plot(fpr_concat, tpr_concat, linewidth=2, label=f'Simple Concat (AUC = {roc_auc_concat:.3f})')
+
+# Attention (No Dropout) ROC
+fpr_attn, tpr_attn, _ = roc_curve(test_metrics['labels'], test_metrics['probabilities'])
+roc_auc_attn = auc(fpr_attn, tpr_attn)
+ax.plot(fpr_attn, tpr_attn, linewidth=2, label=f'Attention Fusion (AUC = {roc_auc_attn:.3f})')
+
+# Full Model ROC
+test_metrics_full = evaluate(trained_model, test_loader_voice, test_loader_gait, nn.BCEWithLogitsLoss(), 'cpu')
+fpr_full, tpr_full, _ = roc_curve(test_metrics_full['labels'], test_metrics_full['probabilities'])
+roc_auc_full = auc(fpr_full, tpr_full)
+ax.plot(fpr_full, tpr_full, linewidth=3, label=f'Proposed Model (AUC = {roc_auc_full:.3f})', linestyle='--')
+
+# Diagonal line
+ax.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
+
+ax.set_xlabel('False Positive Rate', fontsize=12, fontweight='bold')
+ax.set_ylabel('True Positive Rate', fontsize=12, fontweight='bold')
+ax.set_title('ROC Curves: Parkinson\'s Disease Detection', fontsize=14, fontweight='bold')
+ax.legend(loc='lower right', fontsize=10)
+ax.grid(True, alpha=0.3)
+ax.set_xlim([0.0, 1.0])
+ax.set_ylim([0.0, 1.05])
+
+plt.tight_layout()
+plt.savefig('roc_curves.png', dpi=300, bbox_inches='tight')
+plt.savefig('roc_curves.pdf', bbox_inches='tight')
+print("  ✓ Saved: roc_curves.png, roc_curves.pdf")
+plt.close()
+
+# ===========================================================================
+# PLOT 2: CONFUSION MATRIX
+# ===========================================================================
+
+print("[2/3] Generating confusion matrix...")
+
+# Get predictions for full model
+predictions_full = (test_metrics_full['probabilities'] > 0.5).astype(int).flatten()
+labels_full = test_metrics_full['labels'].flatten()
+
+# Compute confusion matrix
+cm = confusion_matrix(labels_full, predictions_full)
+
+# Plot
+fig, ax = plt.subplots(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', square=True,
+            xticklabels=['Control', 'Parkinson\'s'],
+            yticklabels=['Control', 'Parkinson\'s'],
+            cbar_kws={'label': 'Count'},
+            annot_kws={'size': 14, 'weight': 'bold'})
+
+ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold')
+ax.set_ylabel('True Label', fontsize=12, fontweight='bold')
+ax.set_title('Confusion Matrix: Proposed Multimodal Model', fontsize=14, fontweight='bold')
+
+# Add text annotations with percentages
+for i in range(2):
+    for j in range(2):
+        percentage = cm[i, j] / cm[i].sum() * 100
+        ax.text(j + 0.5, i + 0.7, f'({percentage:.1f}%)', 
+                ha='center', va='center', fontsize=10, color='gray')
+
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.savefig('confusion_matrix.pdf', bbox_inches='tight')
+print("  ✓ Saved: confusion_matrix.png, confusion_matrix.pdf")
+plt.close()
+
+# ===========================================================================
+# PLOT 3: ATTENTION WEIGHT DISTRIBUTION
+# ===========================================================================
+
+print("[3/3] Generating attention weight distribution...")
+
+# Get attention weights for all test samples
+trained_model.eval()
+all_attention_weights = []
+
+voice_iter = iter(test_loader_voice)
+
+with torch.no_grad():
+    for gait_windows, gait_labels, _ in test_loader_gait:
+        try:
+            voice_features, _ = next(voice_iter)
+        except StopIteration:
+            voice_iter = iter(test_loader_voice)
+            voice_features, _ = next(voice_iter)
+        
+        min_batch = min(voice_features.size(0), gait_windows.size(0))
+        voice_features = voice_features[:min_batch]
+        gait_windows = gait_windows[:min_batch]
+        
+        _, attention_weights = trained_model(voice_features, gait_windows, return_attention=True)
+        all_attention_weights.append(attention_weights.cpu().numpy())
+
+all_attention_weights = np.vstack(all_attention_weights)
+voice_weights = all_attention_weights[:, 0]
+gait_weights = all_attention_weights[:, 1]
+
+# Create figure with two subplots
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Histogram
+ax1.hist(voice_weights, bins=30, alpha=0.7, label='Voice', color='#3498db', edgecolor='black')
+ax1.hist(gait_weights, bins=30, alpha=0.7, label='Gait', color='#e74c3c', edgecolor='black')
+ax1.axvline(voice_weights.mean(), color='#3498db', linestyle='--', linewidth=2, label=f'Voice Mean: {voice_weights.mean():.3f}')
+ax1.axvline(gait_weights.mean(), color='#e74c3c', linestyle='--', linewidth=2, label=f'Gait Mean: {gait_weights.mean():.3f}')
+ax1.set_xlabel('Attention Weight', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Frequency', fontsize=12, fontweight='bold')
+ax1.set_title('Distribution of Attention Weights', fontsize=13, fontweight='bold')
+ax1.legend(fontsize=10)
+ax1.grid(True, alpha=0.3)
+
+# Violin plot
+parts = ax2.violinplot([voice_weights, gait_weights], positions=[1, 2], 
+                       showmeans=True, showmedians=True)
+ax2.set_xticks([1, 2])
+ax2.set_xticklabels(['Voice', 'Gait'], fontsize=11, fontweight='bold')
+ax2.set_ylabel('Attention Weight', fontsize=12, fontweight='bold')
+ax2.set_title('Attention Weight Distributions', fontsize=13, fontweight='bold')
+ax2.grid(True, alpha=0.3, axis='y')
+
+# Color the violin plots
+colors = ['#3498db', '#e74c3c']
+for i, pc in enumerate(parts['bodies']):
+    pc.set_facecolor(colors[i])
+    pc.set_alpha(0.7)
+
+plt.tight_layout()
+plt.savefig('attention_distribution.png', dpi=300, bbox_inches='tight')
+plt.savefig('attention_distribution.pdf', bbox_inches='tight')
+print("  ✓ Saved: attention_distribution.png, attention_distribution.pdf")
+plt.close()
+
+# ===========================================================================
+# PLOT 4: MODEL COMPARISON BAR CHART
+# ===========================================================================
+
+print("[4/4] Generating model comparison chart...")
+
+# Prepare data
+models = ['Voice\nOnly', 'Gait\nOnly', 'Simple\nConcat', 'Attention\nFusion', 'Proposed\nModel']
+accuracies = [
+    results_dict['Voice-Only']['Accuracy'],
+    results_dict['Gait-Only']['Accuracy'],
+    ablation_results['Simple Concatenation']['Accuracy'],
+    ablation_results['Attention (No Modality Dropout)']['Accuracy'],
+    ablation_results['Full Proposed Model']['Accuracy']
+]
+auc_scores = [
+    results_dict['Voice-Only']['AUC-ROC'],
+    results_dict['Gait-Only']['AUC-ROC'],
+    ablation_results['Simple Concatenation']['AUC-ROC'],
+    ablation_results['Attention (No Modality Dropout)']['AUC-ROC'],
+    ablation_results['Full Proposed Model']['AUC-ROC']
+]
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Accuracy comparison
+x = np.arange(len(models))
+bars1 = ax1.bar(x, accuracies, color=['#95a5a6', '#95a5a6', '#3498db', '#2ecc71', '#e74c3c'], 
+               edgecolor='black', linewidth=1.5)
+ax1.set_ylabel('Accuracy', fontsize=12, fontweight='bold')
+ax1.set_title('Model Comparison: Accuracy', fontsize=13, fontweight='bold')
+ax1.set_xticks(x)
+ax1.set_xticklabels(models, fontsize=10)
+ax1.set_ylim([0.5, 1.0])
+ax1.grid(True, alpha=0.3, axis='y')
+
+# Add value labels on bars
+for bar in bars1:
+    height = bar.get_height()
+    ax1.text(bar.get_x() + bar.get_width()/2., height,
+            f'{height:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+# AUC-ROC comparison
+bars2 = ax2.bar(x, auc_scores, color=['#95a5a6', '#95a5a6', '#3498db', '#2ecc71', '#e74c3c'],
+               edgecolor='black', linewidth=1.5)
+ax2.set_ylabel('AUC-ROC', fontsize=12, fontweight='bold')
+ax2.set_title('Model Comparison: AUC-ROC', fontsize=13, fontweight='bold')
+ax2.set_xticks(x)
+ax2.set_xticklabels(models, fontsize=10)
+ax2.set_ylim([0.5, 1.0])
+ax2.grid(True, alpha=0.3, axis='y')
+
+# Add value labels on bars
+for bar in bars2:
+    height = bar.get_height()
+    ax2.text(bar.get_x() + bar.get_width()/2., height,
+            f'{height:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('model_comparison.png', dpi=300, bbox_inches='tight')
+plt.savefig('model_comparison.pdf', bbox_inches='tight')
+print("  ✓ Saved: model_comparison.png, model_comparison.pdf")
+plt.close()
+
+print("\n" + "="*70)
+print("ALL PLOTS GENERATED SUCCESSFULLY")
+print("="*70)
+print("\nGenerated files:")
+print("  • roc_curves.png / .pdf")
+print("  • confusion_matrix.png / .pdf")
+print("  • attention_distribution.png / .pdf")
+print("  • model_comparison.png / .pdf")
+print("  • baseline_comparison_results.csv")
+print("  • ablation_study_results.csv")
+print("  • complete_experimental_results.csv")
+print("="*70)
